@@ -5,9 +5,35 @@ const heap = std.heap;
 const mem = std.mem;
 const Compile = std.Build.Step.Compile;
 const Target = std.Target;
+const builtin = @import("builtin");
 
+fn createEmsdkStep(b: *std.Build, emsdk: *std.Build.Dependency) *std.Build.Step.Run {
+    if (builtin.os.tag == .windows) {
+        return b.addSystemCommand(&.{emsdk.path("emsdk.bat").getPath(b)});
+    } else {
+        return b.addSystemCommand(&.{emsdk.path("emsdk").getPath(b)});
+    }
+}
+
+fn emSdkSetupStep(b: *std.Build, emsdk: *std.Build.Dependency) !?*std.Build.Step.Run {
+    const dot_emsc_path = emsdk.path(".emscripten").getPath(b);
+    const dot_emsc_exists = !std.meta.isError(std.fs.accessAbsolute(dot_emsc_path, .{}));
+
+    if (!dot_emsc_exists) {
+        const emsdk_install = createEmsdkStep(b, emsdk);
+        emsdk_install.addArgs(&.{ "install", "latest" });
+        const emsdk_activate = createEmsdkStep(b, emsdk);
+        emsdk_activate.addArgs(&.{ "activate", "latest" });
+        emsdk_activate.step.dependOn(&emsdk_install.step);
+        return emsdk_activate;
+    }
+    return null;
+}
 fn initLibConfig(b: *std.Build, target: std.Build.ResolvedTarget, lib: *Compile) void {
-    lib.linkLibC();
+    if (target.result.os.tag != .emscripten) {
+        lib.linkLibC();
+    }
+
     lib.addIncludePath(b.path("src/libsodium/include/sodium"));
     lib.root_module.addCMacro("_GNU_SOURCE", "1");
     lib.root_module.addCMacro("CONFIGURED", "1");
@@ -97,6 +123,16 @@ fn initLibConfig(b: *std.Build, target: std.Build.ResolvedTarget, lib: *Compile)
             lib.root_module.addCMacro("HAVE_SYS_AUXV_H", "1");
             lib.root_module.addCMacro("HAVE_SYS_PARAM_H", "1");
             lib.root_module.addCMacro("HAVE_SYS_RANDOM_H", "1");
+        },
+        .emscripten => {
+            if (b.lazyDependency("emsdk", .{})) |dep| {
+                if (try emSdkSetupStep(b, dep)) |emSdkStep| {
+                    lib.step.dependOn(&emSdkStep.step);
+                }
+                lib.addIncludePath(dep.path("upstream/emscripten/cache/sysroot/include/c++/v1"));
+                lib.addIncludePath(dep.path("upstream/emscripten/cache/sysroot/include/compat"));
+                lib.addIncludePath(dep.path("upstream/emscripten/cache/sysroot/include"));
+            }
         },
         else => {},
     }
@@ -202,7 +238,6 @@ pub fn build(b: *std.Build) !void {
     if (src_dir.access(version_file_path, .{ .mode = .read_only })) {} else |_| {
         try cwd.copyFile(prebuilt_version_file_path, src_dir, version_file_path, .{});
     }
-
     for (libs.items) |lib| {
         b.installArtifact(lib);
         lib.installHeader(b.path(src_path ++ "/include/sodium.h"), "sodium.h");
@@ -237,15 +272,15 @@ pub fn build(b: *std.Build) !void {
         }
     }
 
-    const test_path = "test/default";
-    const out_bin_path = "zig-out/bin";
-    const test_dir = try fs.Dir.openDir(cwd, test_path, .{ .iterate = true, .no_follow = true });
-    fs.Dir.makePath(cwd, out_bin_path) catch {};
-    const out_bin_dir = try fs.Dir.openDir(cwd, out_bin_path, .{});
-    try test_dir.copyFile("run.sh", out_bin_dir, "run.sh", .{});
-    const allocator = heap.page_allocator;
-    var walker = try test_dir.walk(allocator);
     if (build_tests) {
+        const test_path = "test/default";
+        const out_bin_path = "zig-out/bin";
+        const test_dir = try fs.Dir.openDir(cwd, test_path, .{ .iterate = true, .no_follow = true });
+        fs.Dir.makePath(cwd, out_bin_path) catch {};
+        const out_bin_dir = try fs.Dir.openDir(cwd, out_bin_path, .{});
+        try test_dir.copyFile("run.sh", out_bin_dir, "run.sh", .{});
+        const allocator = heap.page_allocator;
+        var walker = try test_dir.walk(allocator);
         while (try walker.next()) |entry| {
             const name = entry.basename;
             if (mem.endsWith(u8, name, ".exp")) {
